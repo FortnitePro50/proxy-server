@@ -49,6 +49,17 @@ function isAllowed(hostname) {
 
 // ─── HTTP PROXY (plain HTTP requests) ────────────────────────────────────────
 function handleHttp(clientReq, clientRes) {
+  // ── Status page — so you can verify it's alive in a browser ──────────────
+  if (clientReq.url === '/' || clientReq.url === '/status') {
+    clientRes.writeHead(200, { 'Content-Type': 'application/json' });
+    return clientRes.end(JSON.stringify({
+      status : 'ok',
+      proxy  : 'residential-proxy',
+      auth   : !!PROXY_SECRET,
+      ts     : Date.now(),
+    }));
+  }
+
   if (!isAuthorized(clientReq)) {
     clientRes.writeHead(407, { 'Proxy-Authenticate': 'Bearer realm="proxy"' });
     return clientRes.end('Proxy auth required');
