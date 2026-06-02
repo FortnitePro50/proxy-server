@@ -22,7 +22,7 @@ const { URL } = require('url');
 
 // ─── CONFIG ───────────────────────────────────────────────────────────────────
 const PORT          = +(process.env.PROXY_PORT   || 3001);
-const PROXY_SECRET  =   process.env.PROXY_SECRET || '';   // set this!
+const PROXY_SECRET  =   process.env.PROXY_SECRET || '6afac4085bd2325ef5b6d3f7291443e8753c45842361767865be9ad356a932ba';   // set this!
 const BIND          =   process.env.PROXY_BIND   || '0.0.0.0';
 
 // Allow all hosts — this proxy is private/server-side only
