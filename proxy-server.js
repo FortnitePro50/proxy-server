@@ -36,9 +36,17 @@ if (!PROXY_SECRET) {
 function isAuthorized(req) {
   if (!PROXY_SECRET) return true;
   const auth = req.headers['proxy-authorization'] || req.headers['authorization'] || '';
-  const token = auth.replace(/^Bearer\s+/i, '').replace(/^Basic\s+.*/i, '');
-  // Support both "Bearer <secret>" and "Proxy-Authorization: <secret>" directly
-  return auth === PROXY_SECRET || token === PROXY_SECRET;
+  // Bearer token (what undici ProxyAgent sends)
+  if (auth.startsWith('Bearer ') && auth.slice(7) === PROXY_SECRET) return true;
+  // Basic auth fallback
+  if (auth.startsWith('Basic ')) {
+    const decoded = Buffer.from(auth.slice(6), 'base64').toString('utf8');
+    const [user]  = decoded.split(':');
+    if (user === PROXY_SECRET) return true;
+  }
+  // Raw secret 
+  if (auth === PROXY_SECRET) return true;
+  return false;
 }
 
 // ─── HOST WHITELIST CHECK ─────────────────────────────────────────────────────
