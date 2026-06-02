@@ -1,171 +1,141 @@
 #!/usr/bin/env node
 /**
- * proxy-server.js — Lightweight residential HTTP/HTTPS proxy
+ * relay-server.js — HTTP relay proxy (works behind any reverse proxy/platform)
  *
- * Run this on your HOME PC (residential IP) so Diploi can tunnel
- * iptvv.ca requests through it and bypass Cloudflare datacenter blocks.
+ * Instead of CONNECT tunneling (which gets blocked by hosting platforms),
+ * this exposes a simple POST /relay endpoint that iptv-gen.js calls directly.
+ * The relay fetches the target URL server-side and returns the response as JSON.
  *
  * Usage:
- *   node proxy-server.js
+ *   PROXY_SECRET=yoursecret node relay-server.js
  *
- * Then set in Diploi env:
- *   PROXY_URL=http://YOUR_HOME_IP:8877
- *   PROXY_SECRET=<same secret as below>
+ * Set in Diploi env:
+ *   PROXY_URL=https://your-proxy-domain.com
+ *   PROXY_SECRET=yoursecret
  */
 
 'use strict';
 
-const http  = require('http');
-const https = require('https');
-const net   = require('net');
+const http = require('http');
 const { URL } = require('url');
 
-// ─── CONFIG ───────────────────────────────────────────────────────────────────
-const PORT          = +(process.env.PROXY_PORT   || 3001);
-const PROXY_SECRET  =   process.env.PROXY_SECRET || '6afac4085bd2325ef5b6d3f7291443e8753c45842361767865be9ad356a932ba';   // set this!
-const BIND          =   process.env.PROXY_BIND   || '0.0.0.0';
+const PORT         = +(process.env.PROXY_PORT   || 3001);
+const PROXY_SECRET =   process.env.PROXY_SECRET || '6afac4085bd2325ef5b6d3f7291443e8753c45842361767865be9ad356a932ba';
+const BIND         =   process.env.PROXY_BIND   || '0.0.0.0';
 
-// Allow all hosts — this proxy is private/server-side only
-const ALLOWED_HOSTS = [];
-
-if (!PROXY_SECRET) {
-  console.warn('[WARN] PROXY_SECRET not set — proxy is OPEN to anyone who knows the port!');
-}
+if (!PROXY_SECRET) console.warn('[WARN] PROXY_SECRET not set — relay is open!');
 
 // ─── AUTH ─────────────────────────────────────────────────────────────────────
 function isAuthorized(req) {
   if (!PROXY_SECRET) return true;
-  const auth = req.headers['proxy-authorization'] || req.headers['authorization'] || '';
-  // Bearer token (what undici ProxyAgent sends)
-  if (auth.startsWith('Bearer ') && auth.slice(7) === PROXY_SECRET) return true;
-  // Basic auth fallback
-  if (auth.startsWith('Basic ')) {
-    const decoded = Buffer.from(auth.slice(6), 'base64').toString('utf8');
-    const [user]  = decoded.split(':');
-    if (user === PROXY_SECRET) return true;
-  }
-  // Raw secret 
+  const auth = req.headers['authorization'] || req.headers['x-proxy-secret'] || '';
   if (auth === PROXY_SECRET) return true;
+  if (auth.startsWith('Bearer ') && auth.slice(7) === PROXY_SECRET) return true;
   return false;
 }
 
-// ─── HOST WHITELIST CHECK ─────────────────────────────────────────────────────
-function isAllowed(hostname) {
-  if (!ALLOWED_HOSTS.length) return true;
-  return ALLOWED_HOSTS.some(h => hostname === h || hostname.endsWith('.' + h));
-}
-
-// ─── HTTP PROXY (plain HTTP requests) ────────────────────────────────────────
-function handleHttp(clientReq, clientRes) {
-  // ── Status page — so you can verify it's alive in a browser ──────────────
-  if (clientReq.url === '/' || clientReq.url === '/status') {
-    clientRes.writeHead(200, { 'Content-Type': 'application/json' });
-    return clientRes.end(JSON.stringify({
-      status : 'ok',
-      proxy  : 'residential-proxy',
-      auth   : !!PROXY_SECRET,
-      ts     : Date.now(),
-    }));
-  }
-
-  if (!isAuthorized(clientReq)) {
-    clientRes.writeHead(407, { 'Proxy-Authenticate': 'Bearer realm="proxy"' });
-    return clientRes.end('Proxy auth required');
-  }
-
-  let targetUrl;
-  try {
-    targetUrl = new URL(clientReq.url);
-  } catch {
-    clientRes.writeHead(400);
-    return clientRes.end('Bad URL');
-  }
-
-  if (!isAllowed(targetUrl.hostname)) {
-    clientRes.writeHead(403);
-    return clientRes.end(`Host not allowed: ${targetUrl.hostname}`);
-  }
-
-  // Strip proxy-only headers
-  const headers = { ...clientReq.headers };
-  delete headers['proxy-authorization'];
-  delete headers['proxy-connection'];
-  headers['connection'] = 'close';
-
-  const lib = targetUrl.protocol === 'https:' ? https : http;
-  const upReq = lib.request({
-    hostname : targetUrl.hostname,
-    port     : targetUrl.port || (targetUrl.protocol === 'https:' ? 443 : 80),
-    path     : targetUrl.pathname + targetUrl.search,
-    method   : clientReq.method,
-    headers,
-    rejectUnauthorized: false,
-  }, upRes => {
-    clientRes.writeHead(upRes.statusCode, upRes.headers);
-    upRes.pipe(clientRes);
-    upRes.on('error', () => clientRes.end());
+// ─── BODY READER ──────────────────────────────────────────────────────────────
+function readBody(req) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    req.on('data',  c => chunks.push(c));
+    req.on('end',   () => resolve(Buffer.concat(chunks)));
+    req.on('error', reject);
   });
-
-  upReq.on('error', err => {
-    console.error(`[HTTP] upstream error: ${err.message}`);
-    if (!clientRes.headersSent) clientRes.writeHead(502);
-    clientRes.end(`Upstream error: ${err.message}`);
-  });
-
-  clientReq.pipe(upReq);
-}
-
-// ─── HTTPS TUNNEL (CONNECT method) ────────────────────────────────────────────
-function handleConnect(req, clientSocket, head) {
-  if (!isAuthorized(req)) {
-    clientSocket.write('HTTP/1.1 407 Proxy Auth Required\r\nProxy-Authenticate: Bearer realm="proxy"\r\n\r\n');
-    return clientSocket.destroy();
-  }
-
-  const [hostname, portStr] = req.url.split(':');
-  const port = parseInt(portStr) || 443;
-
-  if (!isAllowed(hostname)) {
-    clientSocket.write(`HTTP/1.1 403 Forbidden\r\n\r\nHost not allowed: ${hostname}`);
-    return clientSocket.destroy();
-  }
-
-  const serverSocket = net.connect(port, hostname, () => {
-    clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
-    if (head && head.length) serverSocket.write(head);
-    serverSocket.pipe(clientSocket);
-    clientSocket.pipe(serverSocket);
-  });
-
-  serverSocket.on('error', err => {
-    console.error(`[CONNECT] ${hostname}:${port} — ${err.message}`);
-    clientSocket.write(`HTTP/1.1 502 Bad Gateway\r\n\r\n`);
-    clientSocket.destroy();
-  });
-
-  clientSocket.on('error', () => serverSocket.destroy());
-  serverSocket.on('close', () => clientSocket.destroy());
-  clientSocket.on('close', () => serverSocket.destroy());
 }
 
 // ─── SERVER ───────────────────────────────────────────────────────────────────
-const server = http.createServer(handleHttp);
-server.on('connect', handleConnect);
+const server = http.createServer(async (req, res) => {
+  const { pathname } = new URL(req.url, 'http://x');
 
-server.on('error', err => {
-  console.error('[PROXY] Server error:', err.message);
+  // ── GET / or /status — health check (no auth) ─────────────────────────────
+  if (pathname === '/' || pathname === '/status') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    return res.end(JSON.stringify({
+      status: 'ok',
+      proxy:  'residential-relay',
+      auth:   !!PROXY_SECRET,
+      ts:     Date.now(),
+    }));
+  }
+
+  // ── POST /relay — forward any HTTP/S request ──────────────────────────────
+  // Request body (JSON):
+  //   { url, method, headers, body (base64, optional), redirect }
+  // Response (JSON):
+  //   { status, headers, body (base64), url }
+  if (req.method === 'POST' && pathname === '/relay') {
+    if (!isAuthorized(req)) {
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ error: 'Unauthorized' }));
+    }
+
+    let params;
+    try {
+      const raw = await readBody(req);
+      params = JSON.parse(raw.toString('utf8'));
+    } catch {
+      res.writeHead(400);
+      return res.end('Bad JSON');
+    }
+
+    const { url, method = 'GET', headers = {}, body, redirect = 'manual' } = params;
+    if (!url) { res.writeHead(400); return res.end('Missing url'); }
+
+    // Drop hop-by-hop headers
+    const fwdHeaders = { ...headers };
+    delete fwdHeaders['host'];
+    delete fwdHeaders['connection'];
+    delete fwdHeaders['transfer-encoding'];
+
+    try {
+      const upRes  = await fetch(url, {
+        method,
+        headers: fwdHeaders,
+        body:    body ? Buffer.from(body, 'base64') : undefined,
+        redirect,
+      });
+
+      const upBody = Buffer.from(await upRes.arrayBuffer());
+      const upHdrs = {};
+      upRes.headers.forEach((v, k) => { upHdrs[k] = v; });
+
+      // Preserve all Set-Cookie headers (forEach collapses them)
+      if (upRes.headers.getSetCookie) {
+        const cookies = upRes.headers.getSetCookie();
+        if (cookies.length) upHdrs['set-cookie'] = cookies;
+      }
+
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        status:  upRes.status,
+        headers: upHdrs,
+        body:    upBody.toString('base64'),
+        url:     upRes.url || url,
+      }));
+
+      console.log(`[RELAY] ${method} ${url} → ${upRes.status}`);
+    } catch (e) {
+      console.error(`[RELAY] error: ${e.message}`);
+      res.writeHead(502, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: e.message }));
+    }
+    return;
+  }
+
+  res.writeHead(404);
+  res.end('Not found');
 });
 
 server.listen(PORT, BIND, () => {
   console.log('╔══════════════════════════════════════════════════╗');
-  console.log('║   Residential HTTP/S Proxy — ready               ║');
+  console.log('║   Residential Relay Proxy — ready                ║');
   console.log('╠══════════════════════════════════════════════════╣');
-  console.log(`║   Listening : ${BIND}:${PORT}`.padEnd(51) + '║');
-  console.log(`║   Auth      : ${PROXY_SECRET ? 'enabled ✅' : 'DISABLED ⚠️ '}`.padEnd(51) + '║');
-  console.log(`║   Whitelist : ${ALLOWED_HOSTS.length ? ALLOWED_HOSTS.join(', ') : 'all hosts'}`.padEnd(51) + '║');
+  console.log(`║   Listening  : ${BIND}:${PORT}`.padEnd(51) + '║');
+  console.log(`║   Auth       : ${PROXY_SECRET ? 'enabled ✅' : 'DISABLED ⚠️ '}`.padEnd(51) + '║');
   console.log('╠══════════════════════════════════════════════════╣');
   console.log('║   Set in Diploi env:                             ║');
-  console.log(`║   PROXY_URL=http://YOUR_IP:${PORT}`.padEnd(51) + '║');
-  console.log(`║   PROXY_SECRET=<your secret>`.padEnd(51) + '║');
+  console.log('║   PROXY_URL=https://your-domain.com'.padEnd(51)  + '║');
+  console.log('║   PROXY_SECRET=<your secret>'.padEnd(51)         + '║');
   console.log('╚══════════════════════════════════════════════════╝');
 });
